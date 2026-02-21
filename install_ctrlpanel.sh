@@ -339,3 +339,4 @@ echo "DB user:  $DB_USER"
 echo "DB pass:  $DB_PASS"
 echo "------------------------------------------------------------"
 echo "Powered By Saturo Tech"
+EOF
