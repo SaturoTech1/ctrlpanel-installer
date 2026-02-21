@@ -20,7 +20,8 @@ This script automates the full installation of [CtrlPanel.gg](https://ctrlpanel.
 
 Run the following command on your server:
 
-```bash<(curl -s https://raw.githubusercontent.com/SaturoTech1/ctrlpanel-installer/refs/heads/main/install_ctrlpanel.sh)
+```
+bash<(curl -s https://raw.githubusercontent.com/SaturoTech1/ctrlpanel-installer/refs/heads/main/install_ctrlpanel.sh)
 ```
 
 The script will ask for:
