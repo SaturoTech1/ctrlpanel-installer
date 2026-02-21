@@ -1,444 +1,341 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
 
-# Script for automatic installation of Ctrlpanel on Ubuntu 20.04
-# WARNING: Run this script as a user with sudo privileges or as root.
-# The script will install all necessary components and configure the control panel.
+# Powered By Saturo Tech
+BANNER="
+  ____        _ _       _           ____  _           _     
+ / ___|  __ _| (_) __ _| |__  _   _|  _ \\| |__   ___ | |___ 
+ \\___ \\ / _\` | | |/ _\` | '_ \\| | | | |_) | '_ \\ / _ \\| / __|
+  ___) | (_| | | | (_| | |_) | |_| |  __/| | | | (_) | \\__ \\
+ |____/ \\__,_|_|_|\\__,_|_.__/ \\__, |_|   |_| |_|\\___/|_|___/
+                              |___/                        
+                 Powered By Saturo Tech
+"
 
-# --- Banner ---
-echo -e "\e[1;36m"
-echo "  ____             _ __  __          "
-echo " |  _ \\           | |  \\/  |         "
-echo " | |_) | __ _  ___| | \\  / | ___ ___ "
-echo " |  _ < / _\` |/ _ \\ | |\\/| |/ _ \\ __|"
-echo " | |_) | (_| |  __/ | |  | |  __/ |  "
-echo " |____/ \\__,_|\\___|_|_|  |_|\\___|_|  "
-echo "                                     "
-echo "          by Saturo Tech            "
-echo -e "\e[0m"
+echo -e "$BANNER"
 
-# --- Functions ---
-# Function to print informational messages
-function print_info {
-    echo -e "\n\e[34m[INFO]\e[0m $1"
-}
-
-# Function to clean up the installation
-function cleanup_installation {
-    print_info "Stopping services..."
-    sudo systemctl stop ctrlpanel.service 2>/dev/null
-    sudo systemctl disable ctrlpanel.service 2>/dev/null
-    sudo rm -f /etc/systemd/system/ctrlpanel.service 2>/dev/null
-    sudo systemctl daemon-reload 2>/dev/null
-    sudo systemctl stop nginx 2>/dev/null
-    sudo systemctl stop mariadb 2>/dev/null
-    sudo systemctl stop mysql 2>/dev/null # Added for MySQL
-    sudo systemctl stop redis-server 2>/dev/null
-
-    print_info "Removing cron job..."
-    # Check if crontab exists before attempting to remove the job
-    if command -v crontab &> /dev/null; then
-        (sudo crontab -l 2>/dev/null | grep -v "/var/www/ctrlpanel/artisan schedule:run") | sudo crontab - 2>/dev/null
-    fi
-
-    print_info "Removing Nginx configs and SSL certificates..."
-    sudo rm -f /etc/nginx/sites-enabled/ctrlpanel.conf 2>/dev/null
-    sudo rm -f /etc/nginx/sites-available/ctrlpanel.conf 2>/dev/null
-    # Remove SSL certificates and related Certbot configuration
-    sudo certbot delete --non-interactive --cert-name "$DOMAIN" 2>/dev/null
-
-    print_info "Removing database and user..."
-    # Ensure the database service is started for cleanup
-    if [[ "$DB_TYPE" == "mariadb" ]]; then
-        sudo systemctl start mariadb 2>/dev/null
-    elif [[ "$DB_TYPE" == "mysql" ]]; then
-        sudo systemctl start mysql 2>/dev/null
-    fi
-
-    # Use sudo mysql -u root with password for cleanup
-    if sudo mysql -u root -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS $DB_NAME;" 2>/dev/null; then
-        print_info "Database '$DB_NAME' dropped."
-    fi
-    # Remove the user only if it was created on the specified host
-    if sudo mysql -u root -p"$DB_PASSWORD" -e "DROP USER IF EXISTS '$DB_USER'@'$DB_HOST';" 2>/dev/null; then
-        print_info "Database user '$DB_USER'@'$DB_HOST' removed."
-    fi
-
-    if [[ "$DB_TYPE" == "mariadb" ]]; then
-        sudo systemctl stop mariadb 2>/dev/null
-    elif [[ "$DB_TYPE" == "mysql" ]]; then
-        sudo systemctl stop mysql 2>/dev/null
-    fi
-
-    print_info "Removing application directory..."
-    sudo rm -rf /var/www/ctrlpanel 2>/dev/null
-
-    print_info "Removing installed packages..."
-    # List of packages that might have been installed by the script
-    PACKAGES_TO_REMOVE="php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-fpm php8.3-curl php8.3-zip php8.3-intl php8.3-redis nginx git redis-server certbot python3-certbot-nginx ufw composer cron"
-    if [[ "$DB_TYPE" == "mariadb" ]]; then
-        PACKAGES_TO_REMOVE+=" mariadb-server"
-    elif [[ "$DB_TYPE" == "mysql" ]]; then
-        PACKAGES_TO_REMOVE+=" mysql-server mysql-client mysql-common"
-        # Remove MySQL APT repository
-        sudo rm -f /etc/apt/sources.list.d/mysql.list 2>/dev/null
-        sudo rm -f /etc/apt/trusted.gpg.d/mysql.gpg 2>/dev/null
-    fi
-
-    for pkg in $PACKAGES_TO_REMOVE; do
-        if dpkg -s "$pkg" &>/dev/null; then # Check if package is installed
-            print_info "Removing package: $pkg"
-            sudo apt-get -y purge "$pkg" 2>/dev/null
-        fi
-    done
-    sudo apt-get -y autoremove 2>/dev/null
-    sudo apt-get -y clean 2>/dev/null
-
-    print_info "Removing added PPAs and repositories (if applicable, be careful)..."
-    # This part is commented out because it can be too aggressive; uncomment if really necessary.
-    # sudo add-apt-repository --remove ppa:ondrej/php -y 2>/dev/null
-    # sudo rm -f /etc/apt/sources.list.d/redis.list 2>/dev/null
-    # sudo rm -f /etc/apt/sources.list.d/mariadb.list 2>/dev/null # For MariaDB
-    # sudo apt-get update 2>/dev/null
-}
-
-# Function to print error and exit
-function print_error {
-    echo -e "\n\e[31m[ERROR]\e[0m $1" >&2 # Output to stderr
-    echo -e "\n\e[31mInstallation cannot continue due to an error.\e[0m" >&2
-    echo -e "Do you want to clean up everything that the script installed so far? (Press Y to confirm, any other key to exit)"
-    read -n 1 -s -r KEY # Read a single character silently
-    echo # Newline after input
-    if [[ "$KEY" == "Y" || "$KEY" == "y" ]]; then
-        print_info "Starting cleanup..."
-        cleanup_installation
-        print_info "Cleanup finished. Exiting."
-    else
-        print_info "Cleanup cancelled. Exiting."
-    fi
-    exit 1
-}
-
-# Function to ask user for input
-function get_user_input {
-    local prompt_message=$1
-    local default_value=$2
-    local input_var=$3
-
-    read -p "$(echo -e "\n\e[33m[QUESTION]\e[0m $prompt_message [Default: $default_value]: ")" user_input
-    if [[ -z "$user_input" ]]; then
-        eval "$input_var=\"$default_value\""
-    else
-        eval "$input_var=\"$user_input\""
-    fi
-}
-
-# Function to check and configure UFW firewall
-function check_and_configure_firewall {
-    print_info "Checking and configuring UFW firewall..."
-    if command -v ufw &> /dev/null; then
-        UFW_STATUS=$(sudo ufw status | grep "Status: active")
-        if [[ "$UFW_STATUS" == *"Status: active"* ]]; then
-            print_info "UFW is active. Checking rules for ports 80, 443 and OpenSSH..."
-            
-            # Check and allow port 80
-            PORT_80_ALLOWED=$(sudo ufw status | grep -E "80\s+(ALLOW|ALLOW IN)")
-            if [[ -z "$PORT_80_ALLOWED" ]]; then
-                print_info "Port 80 is not allowed. Adding rule..."
-                sudo ufw allow 80/tcp
-                if [ $? -ne 0 ]; then print_error "Failed to allow port 80 in UFW."; fi
-            else
-                print_info "Port 80 is already allowed."
-            fi
-
-            # Check and allow port 443
-            PORT_443_ALLOWED=$(sudo ufw status | grep -E "443\s+(ALLOW|ALLOW IN)")
-            if [[ -z "$PORT_443_ALLOWED" ]]; then
-                print_info "Port 443 is not allowed. Adding rule..."
-                sudo ufw allow 443/tcp
-                if [ $? -ne 0 ]; then print_error "Failed to allow port 443 in UFW."; fi
-            else
-                print_info "Port 443 is already allowed."
-            fi
-            
-            # Check and allow OpenSSH (so you don't lock yourself out)
-            SSH_ALLOWED=$(sudo ufw status | grep -E "OpenSSH\s+ALLOW")
-            if [[ -z "$SSH_ALLOWED" ]]; then
-                print_info "OpenSSH is not allowed. Adding rule..."
-                sudo ufw allow OpenSSH
-                if [ $? -ne 0 ]; then print_error "Failed to allow OpenSSH in UFW."; fi
-            else
-                print_info "OpenSSH is already allowed."
-            fi
-
-            print_info "Reloading UFW to apply changes..."
-            sudo ufw reload
-            print_info "UFW configured."
-        else
-            print_info "UFW is not active. Continuing without configuring UFW."
-        fi
-    else
-        print_info "UFW is not installed. Continuing without configuring UFW."
-    fi
-}
-
-
-# --- User inputs ---
-print_info "Configuring installation parameters:"
-
-get_user_input "Enter the website address (domain or IP)" "my.yoogo.su" DOMAIN
-get_user_input "Enter email for SSL certificate (e.g., admin@example.com)" "admin@example.com" ADMIN_EMAIL
-
-DB_TYPE_CHOICE="mysql"
-while true; do
-    read -p "$(echo -e "\n\e[33m[QUESTION]\e[0m Choose database type (mariadb/mysql) [Default: mysql]: ")" DB_TYPE_INPUT
-    DB_TYPE_INPUT=${DB_TYPE_INPUT:-$DB_TYPE_CHOICE} # Use default if input is empty
-    if [[ "$DB_TYPE_INPUT" == "mariadb" || "$DB_TYPE_INPUT" == "mysql" ]]; then
-        DB_TYPE="$DB_TYPE_INPUT"
-        break
-    else
-        echo -e "\e[31mInvalid choice. Please enter 'mariadb' or 'mysql'.\e[0m"
-    fi
-done
-
-get_user_input "Enter database host address" "127.0.0.1" DB_HOST
-get_user_input "Enter database port" "3306" DB_PORT
-get_user_input "Enter database name" "ctrlpanel" DB_NAME
-get_user_input "Enter database username" "ctrlpaneluser" DB_USER
-
-DEFAULT_DB_PASSWORD=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
-get_user_input "Enter database user password (or press Enter to generate a random one)" "$DEFAULT_DB_PASSWORD" DB_PASSWORD
-
-
-# --- Start installation ---
-print_info "Starting Ctrlpanel installation for domain $DOMAIN"
-sleep 3
-
-# --- 1. Install dependencies ---
-print_info "Updating system and installing base dependencies..."
-sudo apt-get update || print_error "Failed to update package list."
-sudo apt-get -y install software-properties-common curl apt-transport-https ca-certificates gnupg wget || print_error "Failed to install base dependencies."
-
-# Add PHP repository
-print_info "Adding PPA for PHP 8.3..."
-sudo LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || print_error "Failed to add PHP PPA."
-
-# Add Redis repository
-print_info "Adding Redis repository..."
-curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg || print_error "Failed to add Redis GPG key."
-echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list || print_error "Failed to add Redis repository."
-
-# Add database repository
-if [[ "$DB_TYPE" == "mariadb" ]]; then
-    print_info "Adding MariaDB repository..."
-    curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | sudo bash || print_error "Failed to add MariaDB repository."
-elif [[ "$DB_TYPE" == "mysql" ]]; then
-    print_info "Adding MySQL 8 repository..."
-    # Download and install MySQL APT config package
-    wget https://dev.mysql.com/get/mysql-apt-config_0.8.29-1_all.deb -O /tmp/mysql-apt-config.deb || print_error "Failed to download MySQL APT config package."
-    
-    # Preconfigure debconf for MySQL
-    echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.0" | sudo debconf-set-selections
-    echo "mysql-community-server mysql-community-server/root-pass password $DB_PASSWORD" | sudo debconf-set-selections
-    echo "mysql-community-server mysql-community-server/re-root-pass password $DB_PASSWORD" | sudo debconf-set-selections
-    echo "mysql-community-server mysql-community-server/default-auth-plugin select mysql_native_password" | sudo debconf-set-selections # Choose more compatible auth plugin
-
-    sudo DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/mysql-apt-config.deb || print_error "Failed to install MySQL APT config package."
-    rm /tmp/mysql-apt-config.deb
+# Ensure script is run as root
+if [[ "$EUID" -ne 0 ]]; then
+  echo "This script must be run as root. Run: sudo $0"
+  exit 1
 fi
 
-# Update package list after adding repositories
-print_info "Updating package list and cleaning apt cache..."
-sudo apt-get clean && sudo apt-get update || print_error "Failed to update package list or clean apt cache."
+# Helper: prompt with default
+prompt() {
+  local varname="$1"
+  local prompt_text="$2"
+  local default="$3"
+  local silent="${4:-no}" # "yes" to hide input
+  local input
 
-# Install main packages (ufw and cron added)
-print_info "Installing PHP, $DB_TYPE, Nginx, Redis, UFW, Cron and other utilities..."
-DB_PACKAGE=""
-if [[ "$DB_TYPE" == "mariadb" ]]; then
-    DB_PACKAGE="mariadb-server"
-elif [[ "$DB_TYPE" == "mysql" ]]; then
-    DB_PACKAGE="mysql-server"
+  if [[ "$silent" == "yes" ]]; then
+    read -r -s -p "$prompt_text [$default]: " input
+    echo
+  else
+    read -r -p "$prompt_text [$default]: " input
+  fi
+  if [[ -z "$input" ]]; then
+    eval "$varname=\"$default\""
+  else
+    eval "$varname=\"$input\""
+  fi
+}
+
+# Defaults and prompts
+prompt DOMAIN "Enter domain to use for the panel (A record must point to this server)" "panel.localhost"
+prompt SSL_EMAIL "Enter email for SSL certificate (Let's Encrypt) or leave blank to skip" "admin@$DOMAIN"
+
+# Database prompts (defaults accepted by pressing Enter)
+prompt DB_NAME "Enter database name" "ctrlpanel"
+prompt DB_USER "Enter database username" "ctrluser"
+
+# Generate random DB password if left empty (not shown in prompt as default)
+DEFAULT_DB_PASS="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20 || echo 'ctrlpass')"
+read -r -p "Enter database password (press Enter to generate a strong one): " DB_PASS
+if [[ -z "$DB_PASS" ]]; then
+  DB_PASS="$DEFAULT_DB_PASS"
 fi
-sudo apt-get -y install php8.3 php8.3-{common,cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip,intl,redis} "$DB_PACKAGE" nginx git redis-server certbot python3-certbot-nginx ufw cron || print_error "An error occurred while installing PHP 8.3 or other packages. Check the PPA and package availability."
 
-# Call firewall configuration function
-check_and_configure_firewall
+prompt DB_HOST "Enter database host" "localhost"
 
-# Enable Redis
-print_info "Enabling and starting Redis service..."
-sudo systemctl enable --now redis-server || print_error "Failed to enable and start Redis service."
+# Ask for root password (hidden). If blank, socket auth will be attempted.
+prompt MYSQL_ROOT_PASS "Enter MySQL/MariaDB root password (leave blank to use socket auth)" "" "yes"
 
-# --- 2. Install Composer ---
-print_info "Installing Composer..."
-if ! command -v composer &> /dev/null
-then
-    curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer || print_error "Failed to install Composer."
+# Application and repo settings
+APP_DIR="/var/www/ctrlpanel"
+REPO_URL="https://github.com/Ctrlpanel-gg/panel.git"
+
+echo
+echo "[INFO] Summary of inputs:"
+echo "  Domain:        $DOMAIN"
+echo "  SSL Email:     $SSL_EMAIL"
+echo "  DB Host:       $DB_HOST"
+echo "  DB Name:       $DB_NAME"
+echo "  DB User:       $DB_USER"
+echo "  App directory: $APP_DIR"
+echo
+
+read -r -p "Proceed with installation? [Y/n] " proceed
+proceed=${proceed:-Y}
+if [[ ! "$proceed" =~ ^([Yy])$ ]]; then
+  echo "Installation aborted."
+  exit 0
+fi
+
+apt_get_update_if_needed() {
+  if [[ ! -f /var/lib/apt/periodic/update-success-stamp ]] || [[ $(find /var/lib/apt/periodic/update-success-stamp -mmin +60 2>/dev/null || true) ]]; then
+    apt-get update
+  fi
+}
+
+echo "[INFO] Updating package lists..."
+apt_get_update_if_needed
+
+# Install packages (adjust PHP version via meta-package php)
+echo "[INFO] Installing required packages..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  git curl wget unzip ca-certificates gnupg software-properties-common \
+  nginx ufw redis-server \
+  mariadb-server \
+  php-fpm php-cli php-mysql php-xml php-mbstring php-bcmath php-zip php-gd php-curl php-intl \
+  certbot python3-certbot-nginx
+
+# Composer may not be in package; install if missing
+if ! command -v composer >/dev/null 2>&1; then
+  echo "[INFO] Installing Composer..."
+  curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+fi
+
+# Configure UFW
+echo "[INFO] Configuring UFW (allow OpenSSH and Nginx Full)..."
+ufw allow OpenSSH
+ufw allow 'Nginx Full'
+ufw --force enable
+
+# Clone/app setup
+if [[ ! -d "$APP_DIR" ]]; then
+  echo "[INFO] Cloning repository into $APP_DIR..."
+  mkdir -p "$APP_DIR"
+  chown "$SUDO_USER":"$SUDO_USER" "$APP_DIR" 2>/dev/null || true
+  git clone "$REPO_URL" "$APP_DIR" || { echo "[ERROR] Failed to clone $REPO_URL"; exit 1; }
 else
-    print_info "Composer is already installed."
+  echo "[INFO] $APP_DIR already exists — pulling latest changes..."
+  git -C "$APP_DIR" fetch --all || true
+  git -C "$APP_DIR" reset --hard origin/HEAD || true
 fi
 
+# Detect php-fpm socket
+PHP_FPM_SOCK=""
+SOCKS=(/run/php/php*-fpm.sock /var/run/php/php*-fpm.sock)
+for pattern in "${SOCKS[@]}"; do
+  for f in $pattern; do
+    if [[ -S "$f" ]]; then
+      PHP_FPM_SOCK="$f"
+      break 2
+    fi
+  done
+done
+# If not found, try to start php-fpm then retry
+if [[ -z "$PHP_FPM_SOCK" ]]; then
+  echo "[INFO] php-fpm socket not found — attempting to start php-fpm and retry..."
+  systemctl enable --now 'php*-fpm.service' 2>/dev/null || true
+  sleep 2
+  for pattern in "${SOCKS[@]}"; do
+    for f in $pattern; do
+      if [[ -S "$f" ]]; then
+        PHP_FPM_SOCK="$f"
+        break 2
+      fi
+    done
+  done
+fi
 
-# --- 3. Download panel files ---
-print_info "Creating directory and downloading Ctrlpanel files..."
-sudo mkdir -p /var/www/ctrlpanel || print_error "Failed to create /var/www/ctrlpanel directory."
-cd /var/www/ctrlpanel || print_error "Failed to change to /var/www/ctrlpanel directory."
-sudo git clone https://github.com/Ctrlpanel-gg/panel.git . || print_error "Failed to download files from GitHub."
+if [[ -z "$PHP_FPM_SOCK" ]]; then
+  # Fallback to generic socket path (may need manual fix)
+  PHP_FPM_SOCK="/run/php/php7.4-fpm.sock"
+  echo "[WARN] Could not detect php-fpm socket automatically. Using fallback $PHP_FPM_SOCK — verify this is correct."
+fi
 
+# Install Composer dependencies as www-data (safer)
+echo "[INFO] Installing PHP dependencies with Composer (as www-data)..."
+chown -R www-data:www-data "$APP_DIR"
+sudo -u www-data composer install --no-dev --optimize-autoloader -d "$APP_DIR" || { echo "[ERROR] Composer install failed"; exit 1; }
 
-# --- 4. Database setup ---
-print_info "Setting up $DB_TYPE database..."
-# Create user and database
-# Use sudo mysql -u root with the password set via debconf
-sudo mysql -u root -p"$DB_PASSWORD" <<MYSQL_SCRIPT
-CREATE USER '$DB_USER'@'$DB_HOST' IDENTIFIED BY '$DB_PASSWORD';
-CREATE DATABASE $DB_NAME;
-GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'$DB_HOST';
+# Environment setup
+echo "[INFO] Preparing .env"
+if [[ -f "$APP_DIR/.env" ]]; then
+  cp -n "$APP_DIR/.env" "$APP_DIR/.env.bak" || true
+fi
+if [[ -f "$APP_DIR/.env.example" ]]; then
+  cp -f "$APP_DIR/.env.example" "$APP_DIR/.env"
+else
+  echo "[WARN] .env.example not found — creating minimal .env"
+  cat > "$APP_DIR/.env" <<EOL
+APP_NAME=CtrlPanel
+APP_ENV=production
+APP_KEY=
+APP_DEBUG=false
+APP_URL=https://$DOMAIN
+
+DB_CONNECTION=mysql
+DB_HOST=$DB_HOST
+DB_PORT=3306
+DB_DATABASE=$DB_NAME
+DB_USERNAME=$DB_USER
+DB_PASSWORD=$DB_PASS
+EOL
+fi
+
+# Replace or set values in .env reliably
+sed -i "s|APP_URL=.*|APP_URL=https://$DOMAIN|" "$APP_DIR/.env" || true
+sed -i "s|DB_DATABASE=.*|DB_DATABASE=$DB_NAME|" "$APP_DIR/.env" || true
+sed -i "s|DB_USERNAME=.*|DB_USERNAME=$DB_USER|" "$APP_DIR/.env" || true
+sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=$DB_PASS|" "$APP_DIR/.env" || true
+
+# Database creation: use socket auth if no root password supplied, else use temp defaults file
+run_mysql() {
+  local sql="$1"
+  if [[ -z "$MYSQL_ROOT_PASS" ]]; then
+    # Use socket auth; host may be localhost or remote
+    if [[ "$DB_HOST" == "localhost" || "$DB_HOST" == "127.0.0.1" ]]; then
+      mysql -u root -e "$sql"
+    else
+      mysql -u root -h "$DB_HOST" -e "$sql"
+    fi
+  else
+    # Use temporary defaults file to avoid showing password on cmdline
+    local tmpcnf
+    tmpcnf="$(mktemp)"
+    chmod 600 "$tmpcnf"
+    cat > "$tmpcnf" <<EOF
+[client]
+user=root
+password=$MYSQL_ROOT_PASS
+host=$DB_HOST
+EOF
+    mysql --defaults-file="$tmpcnf" -e "$sql"
+    rm -f "$tmpcnf"
+  fi
+}
+
+echo "[INFO] Creating database and user (if not exists)..."
+SQL="
+CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
-MYSQL_SCRIPT
-if [ $? -ne 0 ]; then print_error "Failed to create database or user. Check the root password for MySQL/MariaDB or authentication settings."; fi
-print_info "Database '$DB_NAME' and user '$DB_USER'@'$DB_HOST' created successfully."
+"
+run_mysql "$SQL" || { echo "[ERROR] Database setup failed"; exit 1; }
 
+# Run artisan commands as www-data
+echo "[INFO] Running Laravel artisan commands..."
+cd "$APP_DIR"
+sudo -u www-data php artisan key:generate --force
+sudo -u www-data php artisan migrate --force
+sudo -u www-data php artisan config:cache || true
+sudo -u www-data php artisan route:cache || true
+sudo -u www-data php artisan storage:link || true
 
-# --- 5. Composer dependencies and app setup ---
-print_info "Installing Composer dependencies..."
-cd /var/www/ctrlpanel || print_error "Failed to change to /var/www/ctrlpanel to install Composer dependencies."
-sudo COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader || print_error "Error installing Composer dependencies."
+# Prompt to create admin user via documented command
+echo
+read -r -p "Create initial admin user now using 'php artisan panel:admin'? [Y/n] " create_admin
+create_admin=${create_admin:-Y}
+if [[ "$create_admin" =~ ^([Yy])$ ]]; then
+  if sudo -u www-data php artisan panel:admin; then
+    echo "[INFO] Admin user created via php artisan panel:admin."
+  else
+    echo "[WARN] 'php artisan panel:admin' failed or is unavailable. You can create an admin user manually:"
+    echo "  - SSH to $APP_DIR and run: sudo -u www-data php artisan panel:admin"
+    echo "  - Or use artisan tinker to create a user model if needed."
+  fi
+else
+  echo "[INFO] Skipping admin creation. You can run 'php artisan panel:admin' later in $APP_DIR."
+fi
 
-print_info "Creating storage symlink..."
-sudo php artisan storage:link || print_error "Failed to create storage symlink."
+# Permissions
+echo "[INFO] Setting permissions..."
+chown -R www-data:www-data "$APP_DIR"
+find "$APP_DIR" -type f -exec chmod 644 {} \;
+find "$APP_DIR" -type d -exec chmod 755 {} \;
+chmod -R ug+rwx "$APP_DIR"/storage "$APP_DIR"/bootstrap/cache || true
 
-
-# --- 6. Nginx and SSL setup ---
-print_info "Configuring Nginx and obtaining SSL certificate..."
-# Remove default nginx config
-sudo rm -f /etc/nginx/sites-enabled/default
-
-# Create initial Nginx server block for the domain
-print_info "Creating initial Nginx config for $DOMAIN..."
-sudo tee /etc/nginx/sites-available/ctrlpanel.conf > /dev/null <<EOF
+# Nginx site config
+NGINX_CONF="/etc/nginx/sites-available/ctrlpanel"
+echo "[INFO] Creating Nginx configuration ($NGINX_CONF)..."
+cat > "$NGINX_CONF" <<EOL
 server {
     listen 80;
     server_name $DOMAIN;
 
-    root /var/www/ctrlpanel/public;
-    index index.php;
+    root $APP_DIR/public;
+    index index.php index.html;
 
-    access_log /var/log/nginx/ctrlpanel.app-access.log;
-    error_log  /var/log/nginx/ctrlpanel.app-error.log error;
+    access_log /var/log/nginx/ctrlpanel.access.log;
+    error_log  /var/log/nginx/ctrlpanel.error.log;
 
     client_max_body_size 100m;
     client_body_timeout 120s;
-    sendfile off;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
-    location ~ \.php$ {
-        fastcgi_split_path_info ^(.+\.php)(/.+)$;
-        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
-        fastcgi_index index.php;
-        include fastcgi_params;
-        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:$PHP_FPM_SOCK;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        fastcgi_param HTTP_PROXY "";
-        fastcgi_intercept_errors off;
-        fastcgi_buffer_size 16k;
-        fastcgi_buffers 4 16k;
-        fastcgi_connect_timeout 300;
-        fastcgi_send_timeout 300;
-        fastcgi_read_timeout 300;
-        include /etc/nginx/fastcgi_params;
+        include fastcgi_params;
     }
 
     location ~ /\.ht {
         deny all;
     }
 }
-EOF
+EOL
 
-# Enable the site
-print_info "Enabling Nginx config..."
-sudo ln -s -f /etc/nginx/sites-available/ctrlpanel.conf /etc/nginx/sites-enabled/ctrlpanel.conf
-
-# Test and restart Nginx so Certbot can use the server block
-print_info "Testing and restarting Nginx before requesting SSL..."
-sudo nginx -t || print_error "Nginx configuration test failed after creating the initial file."
-sudo systemctl restart nginx || print_error "Failed to restart Nginx after creating the initial file."
-
-
-# Obtain SSL certificate with retries
-MAX_RETRIES=3
-RETRY_DELAY=10
-CERT_SUCCESS=false
-
-for i in $(seq 1 $MAX_RETRIES); do
-    print_info "Attempt $i of $MAX_RETRIES: Obtaining SSL certificate for $DOMAIN..."
-    # Certbot should find the existing server block and configure it
-    if sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$ADMIN_EMAIL"; then
-        CERT_SUCCESS=true
-        print_info "SSL certificate obtained and installed successfully!"
-        break
-    else
-        print_info "Failed to obtain or install SSL certificate. Retrying in $RETRY_DELAY seconds..."
-        sleep $RETRY_DELAY
-    fi
-done
-
-if [ "$CERT_SUCCESS" = false ]; then
-    print_error "Failed to obtain or install SSL certificate after $MAX_RETRIES attempts. Make sure that:\n" \
-                "  - The DNS A record for $DOMAIN points to this server's IP and has fully propagated.\n" \
-                "  - There are no firewall blocks (for example, UFW configured correctly as attempted, or external firewalls).\n" \
-                "  - You have not exceeded Let's Encrypt rate limits (wait 1-2 hours and try again).\n" \
-                "  Please check Certbot logs: /var/log/letsencrypt/letsencrypt.log for more details."
+ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/ctrlpanel
+# Remove default if present
+if [[ -f /etc/nginx/sites-enabled/default ]]; then
+  rm -f /etc/nginx/sites-enabled/default
 fi
 
-# --- 7. File permissions ---
-print_info "Setting file permissions..."
-sudo chown -R www-data:www-data /var/www/ctrlpanel/ || print_error "Failed to change owner of /var/www/ctrlpanel/."
-sudo chmod -R 755 /var/www/ctrlpanel/storage/* /var/www/ctrlpanel/bootstrap/cache/ || print_error "Failed to set permissions for storage and bootstrap/cache directories."
+echo "[INFO] Testing and reloading Nginx..."
+nginx -t
+systemctl reload nginx
 
+# Setup cron (system cron file so it runs as www-data; artisan schedule uses php binary path)
+echo "[INFO] Installing cron job for Laravel schedule..."
+cat > /etc/cron.d/ctrlpanel <<EOL
+* * * * * www-data /usr/bin/php $APP_DIR/artisan schedule:run >> /dev/null 2>&1
+EOL
+chmod 644 /etc/cron.d/ctrlpanel
 
-# --- 8. Background jobs setup ---
-print_info "Configuring queue worker and cron..."
+# Obtain SSL certificate (skip if using local domain)
+if [[ "$DOMAIN" == "localhost" || "$DOMAIN" == "panel.localhost" || "$DOMAIN" =~ ^127\.0\.0\.1$ ]]; then
+  echo "[INFO] Local domain detected; skipping Let's Encrypt certificate issuance."
+else
+  if [[ -n "$SSL_EMAIL" ]]; then
+    echo "[INFO] Attempting to obtain SSL certificate for $DOMAIN via Certbot..."
+    certbot_args=(--nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$SSL_EMAIL")
+    # Try with --redirect to enable HTTPS
+    if certbot "${certbot_args[@]}" --redirect; then
+      echo "[INFO] SSL certificate obtained and configured."
+    else
+      echo "[WARN] Certbot failed. You can try to run: certbot --nginx -d $DOMAIN -m $SSL_EMAIL"
+    fi
+  else
+    echo "[INFO] No SSL email provided — skipping Certbot. You can run certbot later to obtain a certificate."
+  fi
+fi
 
-# Configure cron
-(sudo crontab -l 2>/dev/null; echo "* * * * * php /var/www/ctrlpanel/artisan schedule:run >> /dev/null 2>&1") | sudo crontab - || print_error "Failed to add cron job."
-print_info "Cron job added."
-
-# Create systemd service for the queue worker
-print_info "Creating systemd service for the queue worker..."
-sudo tee /etc/systemd/system/ctrlpanel.service > /dev/null <<EOF
-[Unit]
-Description=Ctrlpanel Queue Worker
-
-[Service]
-User=www-data
-Group=www-data
-Restart=always
-ExecStart=/usr/bin/php /var/www/ctrlpanel/artisan queue:work --sleep=3 --tries=3
-StartLimitBurst=0
-
-[Install]
-WantedBy=multi-user.target
-EOF
-if [ $? -ne 0 ]; then print_error "Failed to create systemd service for the queue worker."; fi
-
-# Enable and start the service
-sudo systemctl enable --now ctrlpanel.service || print_error "Failed to enable and start the queue worker service."
-print_info "Queue worker service enabled and started."
-
-
-# --- Finish ---
-print_info "\e[32mInstallation completed successfully!\e[0m"
-echo -e "----------------------------------------------------"
-echo -e "You can now open in a browser: \e[1mhttps://$DOMAIN\e[0m"
-echo -e "You will need to finish the setup through the web interface."
-echo -e ""
-echo -e "Database connection details:"
-echo -e "  DB Type:        \e[1m$DB_TYPE\e[0m"
-echo -e "  Host:           \e[1m$DB_HOST\e[0m"
-echo -e "  Port:           \e[1m$DB_PORT\e[0m"
-echo -e "  Database:       \e[1m$DB_NAME\e[0m"
-echo -e "  Username:       \e[1m$DB_USER\e[0m"
-echo -e "  Password:       \e[1m$DB_PASSWORD\e[0m"
-echo -e "----------------------------------------------------"
+echo
+echo "------------------------------------------------------------"
+echo "CtrlPanel installation finished."
+echo "Access:   https://$DOMAIN"
+echo "App dir:  $APP_DIR"
+echo "DB name:  $DB_NAME"
+echo "DB user:  $DB_USER"
+echo "DB pass:  $DB_PASS"
+echo "------------------------------------------------------------"
+echo "Powered By Saturo Tech"
