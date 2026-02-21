@@ -13,7 +13,7 @@ echo " |  _ < / _\` |/ _ \\ | |\\/| |/ _ \\ __|"
 echo " | |_) | (_| |  __/ | |  | |  __/ |  "
 echo " |____/ \\__,_|\\___|_|_|  |_|\\___|_|  "
 echo "                                     "
-echo "          by Dani4eksMe              "
+echo "          by Saturo Tech            "
 echo -e "\e[0m"
 
 # --- Functions ---
